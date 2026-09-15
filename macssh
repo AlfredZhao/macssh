@@ -1,0 +1,301 @@
+#!/bin/bash
+
+# macssh - a tiny host manager built on top of macOS OpenSSH.
+set -u
+
+VERSION="0.1.0"
+SSH_HOME="${MACSSH_HOME:-$HOME/.ssh}"
+CONFIG_FILE="${MACSSH_CONFIG:-$SSH_HOME/config.d/macssh.conf}"
+MAIN_CONFIG="${MACSSH_MAIN_CONFIG:-$SSH_HOME/config}"
+
+die() {
+  printf 'macssh: %s\n' "$*" >&2
+  exit 1
+}
+
+usage() {
+  cat <<'EOF'
+Usage:
+  macssh                         Select and connect to a host
+  macssh add [name] [options]    Add or update a host
+  macssh list                    List managed hosts
+  macssh connect [name]          Connect to a host
+  macssh test <name>             Test authentication
+  macssh edit <name>             Edit a host interactively
+  macssh remove <name>           Remove a host
+  macssh config                  Open the managed SSH config
+  macssh path                    Print the managed SSH config path
+
+Add options:
+  --host HOST     Hostname or IP address
+  --user USER     SSH username
+  --port PORT     SSH port (default: 22)
+  --key PATH      Identity file path
+  --jump HOST     ProxyJump host alias
+  --tags TEXT     Comma-separated tags or a note
+  --yes           Replace an existing host without confirmation
+EOF
+}
+
+init_config() {
+  local config_dir include_line
+  config_dir=$(dirname "$CONFIG_FILE")
+  mkdir -p "$SSH_HOME" "$config_dir" || die "cannot create $config_dir"
+  chmod 700 "$SSH_HOME" "$config_dir" 2>/dev/null || true
+  if [ ! -e "$CONFIG_FILE" ]; then
+    : > "$CONFIG_FILE" || die "cannot create $CONFIG_FILE"
+  fi
+  chmod 600 "$CONFIG_FILE" 2>/dev/null || true
+  if [ ! -s "$CONFIG_FILE" ]; then
+    printf '%s\n' 'IgnoreUnknown UseKeychain' > "$CONFIG_FILE" || die "cannot initialize $CONFIG_FILE"
+  fi
+
+  # Only install an Include when using the default location. Custom paths are
+  # intended for tests and advanced callers.
+  if [ -z "${MACSSH_CONFIG:-}" ]; then
+    touch "$MAIN_CONFIG" || die "cannot create $MAIN_CONFIG"
+    chmod 600 "$MAIN_CONFIG" 2>/dev/null || true
+    include_line="Include ~/.ssh/config.d/*.conf"
+    if ! grep -Fqx "$include_line" "$MAIN_CONFIG" 2>/dev/null; then
+      {
+        [ ! -s "$MAIN_CONFIG" ] || printf '\n'
+        printf '%s\n' "$include_line"
+      } >> "$MAIN_CONFIG" || die "cannot update $MAIN_CONFIG"
+    fi
+  fi
+}
+
+validate_name() {
+  case "$1" in
+    ''|*[!A-Za-z0-9._-]*) die "host name may contain only letters, numbers, dot, underscore, and dash" ;;
+  esac
+}
+
+validate_value() {
+  case "$2" in
+    *$'\n'*|*$'\r'*) die "$1 must be a single line" ;;
+  esac
+}
+
+validate_port() {
+  case "$1" in ''|*[!0-9]*) die "port must be a number" ;; esac
+  [ "$1" -ge 1 ] 2>/dev/null && [ "$1" -le 65535 ] 2>/dev/null || die "port must be between 1 and 65535"
+}
+
+host_exists() {
+  [ -f "$CONFIG_FILE" ] && awk -v wanted="$1" '$1 == "Host" && $2 == wanted { found=1 } END { exit !found }' "$CONFIG_FILE"
+}
+
+get_value() {
+  awk -v wanted="$1" -v key="$2" '
+    $1 == "Host" { inside=($2 == wanted); next }
+    inside && $1 == key {
+      sub(/^[[:space:]]*[^[:space:]]+[[:space:]]+/, "")
+      print
+      exit
+    }
+  ' "$CONFIG_FILE" 2>/dev/null
+}
+
+get_tags() {
+  awk -v wanted="$1" '
+    $1 == "Host" { inside=($2 == wanted); next }
+    inside && /^[[:space:]]*#[[:space:]]*Tags:/ {
+      sub(/^[[:space:]]*#[[:space:]]*Tags:[[:space:]]*/, "")
+      print
+      exit
+    }
+  ' "$CONFIG_FILE" 2>/dev/null
+}
+
+remove_block() {
+  local name="$1" tmp
+  tmp=$(mktemp "${CONFIG_FILE}.XXXXXX") || die "cannot create temporary file"
+  awk -v wanted="$name" '
+    $1 == "Host" {
+      if ($2 == wanted) { skip=1; next }
+      skip=0
+    }
+    !skip { print }
+  ' "$CONFIG_FILE" > "$tmp" || { rm -f "$tmp"; die "cannot rewrite config"; }
+  chmod 600 "$tmp" 2>/dev/null || true
+  mv "$tmp" "$CONFIG_FILE" || { rm -f "$tmp"; die "cannot replace config"; }
+}
+
+prompt_default() {
+  local label="$1" default_value="$2" answer
+  if [ -n "$default_value" ]; then
+    printf '%s [%s]: ' "$label" "$default_value" >&2
+  else
+    printf '%s: ' "$label" >&2
+  fi
+  IFS= read -r answer || true
+  printf '%s' "${answer:-$default_value}"
+}
+
+quote_ssh_value() {
+  # OpenSSH accepts double-quoted arguments; backslash and quote are escaped.
+  printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g; s/^/"/; s/$/"/'
+}
+
+write_host() {
+  local name="$1" hostname="$2" user="$3" port="$4" key="$5" jump="$6" tags="$7"
+  {
+    [ ! -s "$CONFIG_FILE" ] || printf '\n'
+    printf 'Host %s\n' "$name"
+    printf '    HostName %s\n' "$(quote_ssh_value "$hostname")"
+    [ -z "$user" ] || printf '    User %s\n' "$(quote_ssh_value "$user")"
+    printf '    Port %s\n' "$port"
+    if [ -n "$key" ]; then
+      printf '    IdentityFile %s\n' "$(quote_ssh_value "$key")"
+      printf '    IdentitiesOnly yes\n'
+      printf '    AddKeysToAgent yes\n'
+      printf '    UseKeychain yes\n'
+    fi
+    [ -z "$jump" ] || printf '    ProxyJump %s\n' "$(quote_ssh_value "$jump")"
+    printf '    ServerAliveInterval 30\n'
+    printf '    ServerAliveCountMax 3\n'
+    [ -z "$tags" ] || printf '    # Tags: %s\n' "$tags"
+  } >> "$CONFIG_FILE" || die "cannot write $CONFIG_FILE"
+}
+
+cmd_add() {
+  init_config
+  local name="" hostname="" user="" port="22" key="" jump="" tags="" assume_yes=0 interactive=0 force_interactive=0
+  if [ $# -gt 0 ] && [ "${1#--}" = "$1" ]; then name="$1"; shift; fi
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --host|--user|--port|--key|--jump|--tags)
+        [ $# -ge 2 ] || die "$1 requires a value"
+        case "$1" in
+          --host) hostname="$2" ;; --user) user="$2" ;; --port) port="$2" ;;
+          --key) key="$2" ;; --jump) jump="$2" ;; --tags) tags="$2" ;;
+        esac
+        shift 2 ;;
+      --yes) assume_yes=1; shift ;;
+      --interactive) interactive=1; force_interactive=1; shift ;;
+      *) die "unknown option: $1" ;;
+    esac
+  done
+
+  [ -n "$name" ] || { name=$(prompt_default "Name" ""); interactive=1; }
+  validate_name "$name"
+  if host_exists "$name"; then
+    [ -n "$hostname" ] || hostname=$(get_value "$name" HostName)
+    [ -n "$user" ] || user=$(get_value "$name" User)
+    [ "$port" != "22" ] || port=$(get_value "$name" Port); port=${port:-22}
+    [ -n "$key" ] || key=$(get_value "$name" IdentityFile); key=${key#\"}; key=${key%\"}
+    [ -n "$jump" ] || jump=$(get_value "$name" ProxyJump); jump=${jump#\"}; jump=${jump%\"}
+    [ -n "$tags" ] || tags=$(get_tags "$name")
+    if [ "$assume_yes" -ne 1 ] && [ "$interactive" -ne 1 ]; then
+      printf "Host '%s' exists. Replace it? [y/N] " "$name" >&2
+      IFS= read -r reply || true
+      case "$reply" in y|Y|yes|YES) ;; *) die "cancelled" ;; esac
+    fi
+  fi
+
+  if [ -z "$hostname" ]; then hostname=$(prompt_default "Hostname or IP" ""); interactive=1; fi
+  if [ "$interactive" -eq 1 ]; then
+    if [ "$force_interactive" -eq 1 ]; then hostname=$(prompt_default "Hostname or IP" "$hostname"); fi
+    user=$(prompt_default "User" "$user")
+    port=$(prompt_default "Port" "$port")
+    key=$(prompt_default "Private key path (optional)" "$key")
+    jump=$(prompt_default "ProxyJump host (optional)" "$jump")
+    tags=$(prompt_default "Tags/note (optional)" "$tags")
+  fi
+  [ -n "$hostname" ] || die "hostname is required"
+  validate_port "$port"
+  validate_value hostname "$hostname"; validate_value user "$user"; validate_value key "$key"
+  validate_value jump "$jump"; validate_value tags "$tags"
+  host_exists "$name" && remove_block "$name"
+  write_host "$name" "$hostname" "$user" "$port" "$key" "$jump" "$tags"
+  printf "Saved '%s'. Connect with: macssh connect %s\n" "$name" "$name"
+}
+
+cmd_list() {
+  init_config
+  printf '%-22s %-28s %-16s %-6s %s\n' NAME HOST USER PORT TAGS
+  awk '
+    function emit() {
+      if (name != "") printf "%-22s %-28s %-16s %-6s %s\n", name, host, user, port, tags
+    }
+    $1 == "Host" { emit(); name=$2; host=""; user=""; port="22"; tags=""; next }
+    name != "" && $1 == "HostName" { host=$2; gsub(/^"|"$/, "", host); next }
+    name != "" && $1 == "User" { user=$2; gsub(/^"|"$/, "", user); next }
+    name != "" && $1 == "Port" { port=$2; next }
+    name != "" && /^[[:space:]]*#[[:space:]]*Tags:/ {
+      line=$0; sub(/^[[:space:]]*#[[:space:]]*Tags:[[:space:]]*/, "", line); tags=line
+    }
+    END { emit() }
+  ' "$CONFIG_FILE"
+}
+
+select_host() {
+  local names=() name choice i=1
+  while IFS= read -r name; do [ -n "$name" ] && names[${#names[@]}]="$name"; done < <(awk '$1 == "Host" { print $2 }' "$CONFIG_FILE")
+  [ ${#names[@]} -gt 0 ] || die "no hosts configured; run: macssh add"
+  for name in "${names[@]}"; do printf '%3d) %s\n' "$i" "$name" >&2; i=$((i + 1)); done
+  printf 'Select host: ' >&2
+  IFS= read -r choice || true
+  case "$choice" in ''|*[!0-9]*) die "invalid selection" ;; esac
+  [ "$choice" -ge 1 ] 2>/dev/null && [ "$choice" -le ${#names[@]} ] 2>/dev/null || die "invalid selection"
+  printf '%s' "${names[$((choice - 1))]}"
+}
+
+resolve_host() {
+  init_config
+  local name="${1:-}"
+  [ -n "$name" ] || name=$(select_host)
+  host_exists "$name" || die "unknown host: $name"
+  printf '%s' "$name"
+}
+
+cmd_connect() {
+  local name
+  name=$(resolve_host "${1:-}")
+  exec ssh "$name"
+}
+
+cmd_test() {
+  [ $# -eq 1 ] || die "test requires a host name"
+  local name
+  name=$(resolve_host "$1")
+  printf "Testing '%s'...\n" "$name"
+  ssh -o BatchMode=yes -o ConnectTimeout=5 "$name" true
+}
+
+cmd_remove() {
+  [ $# -eq 1 ] || die "remove requires a host name"
+  init_config
+  validate_name "$1"
+  host_exists "$1" || die "unknown host: $1"
+  printf "Remove '%s'? [y/N] " "$1" >&2
+  IFS= read -r reply || true
+  case "$reply" in y|Y|yes|YES) remove_block "$1"; printf "Removed '%s'.\n" "$1" ;; *) die "cancelled" ;; esac
+}
+
+cmd_config() {
+  init_config
+  local editor="${VISUAL:-${EDITOR:-vi}}"
+  "$editor" "$CONFIG_FILE"
+}
+
+main() {
+  local command="${1:-connect}"
+  [ $# -eq 0 ] || shift
+  case "$command" in
+    add) cmd_add "$@" ;;
+    list|ls) cmd_list "$@" ;;
+    connect|ssh) cmd_connect "$@" ;;
+    test) cmd_test "$@" ;;
+    edit) [ $# -eq 1 ] || die "edit requires a host name"; cmd_add "$1" --interactive ;;
+    remove|rm) cmd_remove "$@" ;;
+    config) cmd_config "$@" ;;
+    path) init_config; printf '%s\n' "$CONFIG_FILE" ;;
+    version|--version|-v) printf 'macssh %s\n' "$VERSION" ;;
+    help|--help|-h) usage ;;
+    *) die "unknown command: $command (run 'macssh help')" ;;
+  esac
+}
+
+main "$@"
