@@ -73,7 +73,22 @@ macssh edit prod       # 修改，直接回车保留原值
 macssh remove prod     # 删除，执行前要求确认
 ```
 
-## 5. 使用原生 SSH 工具
+## 5. 上传和下载
+
+在本机再开一个终端标签页即可传输，不必断开当前 SSH。
+
+```bash
+macssh put prod ./app.conf /etc/app/
+macssh put prod ./dist /opt/app
+macssh get prod /var/log/app.log ./
+macssh get prod /opt/app/dist ./dist
+```
+
+省略远端路径时，文件传到远端家目录；省略本地路径时，下载到当前目录。文件夹会递归复制，跳板机同样生效。
+
+`upload` / `download` 是 `put` / `get` 的别名。大目录增量同步仍可直接用 `rsync`。
+
+## 6. 使用原生 SSH 工具
 
 `macssh` 生成标准 OpenSSH 配置，因此也可以直接使用：
 
@@ -83,7 +98,7 @@ scp local.txt prod:/tmp/
 sftp prod
 ```
 
-## 6. 配置文件
+## 7. 配置文件
 
 主机配置保存在：
 
@@ -102,7 +117,7 @@ macssh path            # 查看配置文件路径
 macssh config          # 编辑原始 SSH 配置
 ```
 
-## 7. 命令速查
+## 8. 命令速查
 
 ```text
 macssh                  选择并连接主机
@@ -110,6 +125,8 @@ macssh add [名称]       添加主机
 macssh list             查看主机
 macssh connect [名称]   连接主机
 macssh test <名称>      测试 Key 登录
+macssh put <名称> <本地> [远端]   上传文件或文件夹
+macssh get <名称> <远端> [本地]   下载文件或文件夹
 macssh edit <名称>      修改主机
 macssh remove <名称>    删除主机
 macssh config           编辑原始 SSH 配置

@@ -3,7 +3,7 @@
 # macssh - a tiny host manager built on top of macOS OpenSSH.
 set -u
 
-VERSION="0.1.0"
+VERSION="0.2.0"
 SSH_HOME="${MACSSH_HOME:-$HOME/.ssh}"
 CONFIG_FILE="${MACSSH_CONFIG:-$SSH_HOME/config.d/macssh.conf}"
 MAIN_CONFIG="${MACSSH_MAIN_CONFIG:-$SSH_HOME/config}"
@@ -21,6 +21,10 @@ Usage:
   macssh list                    List managed hosts
   macssh connect [name]          Connect to a host
   macssh test <name>             Test authentication
+  macssh put <name> <local> [remote]
+                                Upload a file or folder
+  macssh get <name> <remote> [local]
+                                Download a file or folder
   macssh edit <name>             Edit a host interactively
   macssh remove <name>           Remove a host
   macssh config                  Open the managed SSH config
@@ -264,6 +268,38 @@ cmd_test() {
   ssh -o BatchMode=yes -o ConnectTimeout=5 "$name" true
 }
 
+cmd_put() {
+  [ $# -ge 2 ] || die "put requires a host name and a local path"
+  [ $# -le 3 ] || die "usage: macssh put <name> <local> [remote]"
+  local name local_path remote_path dest
+  name=$(resolve_host "$1")
+  local_path="$2"
+  remote_path="${3:-}"
+  validate_value path "$local_path"
+  validate_value path "$remote_path"
+  [ -e "$local_path" ] || die "local path not found: $local_path"
+  dest="$name:${remote_path:-}"
+  printf "Uploading '%s' to '%s'\n" "$local_path" "$dest"
+  if [ -d "$local_path" ]; then
+    scp -r "$local_path" "$dest"
+  else
+    scp "$local_path" "$dest"
+  fi
+}
+
+cmd_get() {
+  [ $# -ge 2 ] || die "get requires a host name and a remote path"
+  [ $# -le 3 ] || die "usage: macssh get <name> <remote> [local]"
+  local name remote_path local_path
+  name=$(resolve_host "$1")
+  remote_path="$2"
+  local_path="${3:-.}"
+  validate_value path "$remote_path"
+  validate_value path "$local_path"
+  printf "Downloading '%s:%s' to '%s'\n" "$name" "$remote_path" "$local_path"
+  scp -r "$name:$remote_path" "$local_path"
+}
+
 cmd_remove() {
   [ $# -eq 1 ] || die "remove requires a host name"
   init_config
@@ -288,6 +324,8 @@ main() {
     list|ls) cmd_list "$@" ;;
     connect|ssh) cmd_connect "$@" ;;
     test) cmd_test "$@" ;;
+    put|upload) cmd_put "$@" ;;
+    get|download) cmd_get "$@" ;;
     edit) [ $# -eq 1 ] || die "edit requires a host name"; cmd_add "$1" --interactive ;;
     remove|rm) cmd_remove "$@" ;;
     config) cmd_config "$@" ;;
