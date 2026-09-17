@@ -72,4 +72,21 @@ grep -Fq -- "-r $test_root/folder transfer:/opt/app" "$SCP_LOG" || fail 'put did
 "$project_dir/macssh" get transfer /var/log/app.log ./out.log >/dev/null
 grep -Fq -- "-r transfer:/var/log/app.log ./out.log" "$SCP_LOG" || fail 'get did not pass scp args'
 
+if "$project_dir/macssh" test >/dev/null 2>&1; then fail 'test without args succeeded'; fi
+if "$project_dir/macssh" test missing-host >/dev/null 2>&1; then fail 'test unknown host succeeded'; fi
+
+export SSH_LOG="$test_root/ssh.log"
+export SSH_EXIT=0
+printf '%s\n' '#!/bin/bash' 'printf "%s\n" "$*" > "$SSH_LOG"' 'exit "${SSH_EXIT:-0}"' > "$fake_bin/ssh"
+chmod +x "$fake_bin/ssh"
+
+test_ok=$("$project_dir/macssh" test transfer)
+printf '%s' "$test_ok" | grep -Fq "Testing 'transfer'..." || fail 'test omitted progress'
+printf '%s' "$test_ok" | grep -Fq "Authentication succeeded for 'transfer'." || fail 'test omitted success'
+grep -Fq -- "-o BatchMode=yes -o ConnectTimeout=5 transfer true" "$SSH_LOG" || fail 'test did not pass ssh args'
+
+SSH_EXIT=1
+if test_err=$("$project_dir/macssh" test transfer 2>&1); then fail 'test succeeded when ssh failed'; fi
+printf '%s' "$test_err" | grep -Fq "authentication failed for 'transfer'" || fail 'test omitted failure'
+
 printf 'All tests passed.\n'

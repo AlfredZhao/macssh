@@ -265,7 +265,11 @@ cmd_test() {
   local name
   name=$(resolve_host "$1")
   printf "Testing '%s'...\n" "$name"
-  ssh -o BatchMode=yes -o ConnectTimeout=5 "$name" true
+  if ssh -o BatchMode=yes -o ConnectTimeout=5 "$name" true; then
+    printf "Authentication succeeded for '%s'.\n" "$name"
+  else
+    die "authentication failed for '$name'"
+  fi
 }
 
 cmd_put() {
