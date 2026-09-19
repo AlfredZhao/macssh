@@ -61,10 +61,13 @@ macssh add internal-db \
 
 ```bash
 macssh list            # 查看所有主机
-macssh connect prod    # 连接指定主机
+macssh connect prod         # 连接指定主机
+macssh connect prod --log   # 连接并保存可读会话日志到 ~/ssh-logs
 macssh                 # 从编号菜单选择主机
 macssh test prod       # 测试 Key 登录
 ```
+
+`--log` 会保存一份可读的会话日志到 `~/ssh-logs/<主机名>-<时间>.log`。不加该参数时，连接行为与原来相同。
 
 ## 4. 修改和删除
 
@@ -123,7 +126,7 @@ macssh config          # 编辑原始 SSH 配置
 macssh                  选择并连接主机
 macssh add [名称]       添加主机
 macssh list             查看主机
-macssh connect [名称]   连接主机
+macssh connect [名称] [--log]  连接主机，可选记录会话日志
 macssh test <名称>      测试 Key 登录
 macssh put <名称> <本地> [远端]   上传文件或文件夹
 macssh get <名称> <远端> [本地]   下载文件或文件夹

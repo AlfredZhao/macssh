@@ -8,6 +8,7 @@ trap 'rm -rf "$test_root"' EXIT
 export MACSSH_HOME="$test_root/.ssh"
 export MACSSH_CONFIG="$MACSSH_HOME/config.d/macssh.conf"
 export MACSSH_MAIN_CONFIG="$MACSSH_HOME/config"
+export MACSSH_LOG_DIR="$test_root/ssh-logs"
 
 fail() { printf 'FAIL: %s\n' "$*" >&2; exit 1; }
 assert_contains() { grep -Fq "$2" "$1" || fail "$1 does not contain: $2"; }
@@ -42,6 +43,7 @@ if "$project_dir/macssh" add bad-port --host example.com --port 70000 >/dev/null
 help_output=$("$project_dir/macssh" help)
 printf '%s' "$help_output" | grep -Fq 'macssh put' || fail 'help omitted put'
 printf '%s' "$help_output" | grep -Fq 'macssh get' || fail 'help omitted get'
+printf '%s' "$help_output" | grep -Fq -- '--log' || fail 'help omitted --log'
 
 "$project_dir/macssh" add transfer --host example.com --user ubuntu --yes >/dev/null
 
@@ -88,5 +90,37 @@ grep -Fq -- "-o BatchMode=yes -o ConnectTimeout=5 transfer true" "$SSH_LOG" || f
 SSH_EXIT=1
 if test_err=$("$project_dir/macssh" test transfer 2>&1); then fail 'test succeeded when ssh failed'; fi
 printf '%s' "$test_err" | grep -Fq "authentication failed for 'transfer'" || fail 'test omitted failure'
+
+SSH_EXIT=0
+"$project_dir/macssh" connect transfer
+grep -Fq 'transfer' "$SSH_LOG" || fail 'connect did not pass ssh host'
+if ls "$MACSSH_LOG_DIR"/*.log >/dev/null 2>&1; then fail 'connect without --log wrote a log'; fi
+
+if "$project_dir/macssh" connect transfer --verbose >/dev/null 2>&1; then fail 'connect unknown option succeeded'; fi
+if "$project_dir/macssh" connect transfer extra >/dev/null 2>&1; then fail 'connect extra arg succeeded'; fi
+
+printf '%s\n' '#!/bin/bash' \
+  'while [ $# -gt 0 ]; do case "$1" in -q|-a|-k|-e) shift ;; *) break ;; esac; done' \
+  'file=$1; shift' \
+  'printf "hello\r\n\033[32mgreen\033[0m\nbell\a\n" > "$file"' \
+  'exec "$@"' > "$fake_bin/script"
+chmod +x "$fake_bin/script"
+
+log_output=$("$project_dir/macssh" connect transfer --log)
+printf '%s' "$log_output" | grep -Fq "Logging to '" || fail 'connect --log omitted logging message'
+printf '%s' "$log_output" | grep -Fq "Saved session log to '" || fail 'connect --log omitted saved message'
+log_file=$(printf '%s\n' "$log_output" | sed -n "s/.*Saved session log to '\\(.*\\)'/\\1/p")
+[ -n "$log_file" ] || fail 'connect --log did not print log path'
+[ -f "$log_file" ] || fail 'connect --log did not create log file'
+grep -Fq 'hello' "$log_file" || fail 'log omitted hello'
+grep -Fq 'green' "$log_file" || fail 'log omitted stripped color text'
+if grep -q $'\r' "$log_file"; then fail 'log still contains CR'; fi
+if grep -q $'\033' "$log_file"; then fail 'log still contains escape'; fi
+if grep -q $'\a' "$log_file"; then fail 'log still contains bell'; fi
+grep -Fq 'transfer' "$SSH_LOG" || fail 'connect --log did not pass ssh host'
+
+"$project_dir/macssh" connect --log transfer >/dev/null
+log_count=$(find "$MACSSH_LOG_DIR" -name 'transfer-*.log' | wc -l)
+[ "$log_count" -eq 2 ] || fail "expected 2 session logs, got $log_count"
 
 printf 'All tests passed.\n'

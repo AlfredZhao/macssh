@@ -3,10 +3,11 @@
 # macssh - a tiny host manager built on top of macOS OpenSSH.
 set -u
 
-VERSION="0.2.0"
+VERSION="0.3.0"
 SSH_HOME="${MACSSH_HOME:-$HOME/.ssh}"
 CONFIG_FILE="${MACSSH_CONFIG:-$SSH_HOME/config.d/macssh.conf}"
 MAIN_CONFIG="${MACSSH_MAIN_CONFIG:-$SSH_HOME/config}"
+LOG_DIR="${MACSSH_LOG_DIR:-$HOME/ssh-logs}"
 
 die() {
   printf 'macssh: %s\n' "$*" >&2
@@ -19,7 +20,7 @@ Usage:
   macssh                         Select and connect to a host
   macssh add [name] [options]    Add or update a host
   macssh list                    List managed hosts
-  macssh connect [name]          Connect to a host
+  macssh connect [name] [--log]  Connect to a host
   macssh test <name>             Test authentication
   macssh put <name> <local> [remote]
                                 Upload a file or folder
@@ -38,6 +39,9 @@ Add options:
   --jump HOST     ProxyJump host alias
   --tags TEXT     Comma-separated tags or a note
   --yes           Replace an existing host without confirmation
+
+Connect options:
+  --log           Save a readable session log to ~/ssh-logs
 EOF
 }
 
@@ -254,10 +258,60 @@ resolve_host() {
   printf '%s' "$name"
 }
 
+write_readable_log() {
+  local raw="$1" log="$2" cleaned
+  cleaned=$(mktemp "${TMPDIR:-/tmp}/macssh.XXXXXX") || die "cannot create temporary log"
+  # Strip ANSI/control chars, then apply backspaces so the log matches the screen.
+  if ! perl -pe 's/\e\[[0-9;?]*[A-Za-z]//g; s/\e\][^\a]*\a//g; s/\r//g; s/\a//g' "$raw" > "$cleaned"; then
+    rm -f "$cleaned"
+    die "cannot clean session log"
+  fi
+  if ! col -b < "$cleaned" > "$log" 2>/dev/null; then
+    cp "$cleaned" "$log" || die "cannot write $log"
+  fi
+  rm -f "$cleaned"
+  chmod 600 "$log" 2>/dev/null || true
+}
+
+connect_with_log() {
+  local name="$1" stamp raw log status=0 i=1
+  command -v script >/dev/null 2>&1 || die "--log requires the macOS script command"
+  command -v perl >/dev/null 2>&1 || die "--log requires perl"
+  mkdir -p "$LOG_DIR" || die "cannot create $LOG_DIR"
+  chmod 700 "$LOG_DIR" 2>/dev/null || true
+  stamp=$(date +%Y%m%d-%H%M%S)
+  log="$LOG_DIR/${name}-${stamp}.log"
+  while [ -e "$log" ]; do
+    log="$LOG_DIR/${name}-${stamp}-$i.log"
+    i=$((i + 1))
+  done
+  raw=$(mktemp "${TMPDIR:-/tmp}/macssh.XXXXXX") || die "cannot create temporary log"
+  printf "Logging to '%s'\n" "$log"
+  script -q "$raw" ssh "$name" || status=$?
+  write_readable_log "$raw" "$log"
+  rm -f "$raw"
+  printf "Saved session log to '%s'\n" "$log"
+  return "$status"
+}
+
 cmd_connect() {
-  local name
-  name=$(resolve_host "${1:-}")
-  exec ssh "$name"
+  local name="" enable_log=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --log) enable_log=1; shift ;;
+      --*) die "unknown option: $1" ;;
+      *)
+        [ -z "$name" ] || die "usage: macssh connect [name] [--log]"
+        name="$1"
+        shift
+        ;;
+    esac
+  done
+  name=$(resolve_host "$name")
+  if [ "$enable_log" -eq 0 ]; then
+    exec ssh "$name"
+  fi
+  connect_with_log "$name"
 }
 
 cmd_test() {
@@ -327,6 +381,7 @@ main() {
     add) cmd_add "$@" ;;
     list|ls) cmd_list "$@" ;;
     connect|ssh) cmd_connect "$@" ;;
+    --log) cmd_connect --log "$@" ;;
     test) cmd_test "$@" ;;
     put|upload) cmd_put "$@" ;;
     get|download) cmd_get "$@" ;;
