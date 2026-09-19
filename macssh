@@ -3,7 +3,7 @@
 # macssh - a tiny host manager built on top of macOS OpenSSH.
 set -u
 
-VERSION="0.3.0"
+VERSION="0.3.1"
 SSH_HOME="${MACSSH_HOME:-$HOME/.ssh}"
 CONFIG_FILE="${MACSSH_CONFIG:-$SSH_HOME/config.d/macssh.conf}"
 MAIN_CONFIG="${MACSSH_MAIN_CONFIG:-$SSH_HOME/config}"
@@ -261,8 +261,88 @@ resolve_host() {
 write_readable_log() {
   local raw="$1" log="$2" cleaned
   cleaned=$(mktemp "${TMPDIR:-/tmp}/macssh.XXXXXX") || die "cannot create temporary log"
-  # Strip ANSI/control chars, then apply backspaces so the log matches the screen.
-  if ! perl -pe 's/\e\[[0-9;?]*[A-Za-z]//g; s/\e\][^\a]*\a//g; s/\r//g; s/\a//g' "$raw" > "$cleaned"; then
+  # Replay in-place updates (CR/erase/cursor) so spinner and TUI frames collapse.
+  if ! perl - "$raw" > "$cleaned" <<'PERL'
+use strict;
+use warnings;
+use Encode qw(decode);
+binmode STDOUT, ':encoding(UTF-8)';
+
+my $raw = do { local $/; open my $fh, '<:raw', $ARGV[0] or die $!; <$fh> };
+$raw = '' unless defined $raw;
+my $buf = decode('UTF-8', $raw, Encode::FB_DEFAULT);
+$buf =~ s/\r\n/\n/g;
+
+my @line;
+my $col = 0;
+
+sub emit {
+    print join('', @line), "\n";
+    @line = ();
+    $col = 0;
+}
+
+sub put {
+    my ($ch) = @_;
+    while (@line < $col) {
+        push @line, ' ';
+    }
+    if ($col == @line) {
+        push @line, $ch;
+    } else {
+        $line[$col] = $ch;
+    }
+    $col++;
+}
+
+sub csi {
+    my ($params, $inter, $final) = @_;
+    return if $inter ne '';
+    my $n = 0;
+    if ($params =~ /^(\d+)/) {
+        $n = 0 + $1;
+    }
+    if ($final eq 'K') {
+        $n = 0 if $params eq '';
+        if ($n == 2) {
+            @line = ();
+        } elsif ($n == 1) {
+            for my $i (0 .. $col - 1) {
+                $line[$i] = ' ' if $i < @line;
+            }
+        } elsif ($col < @line) {
+            splice @line, $col;
+        }
+    } elsif ($final eq 'C') {
+        $col += ($n || 1);
+    } elsif ($final eq 'D') {
+        $col -= ($n || 1);
+        $col = 0 if $col < 0;
+    } elsif ($final eq 'G') {
+        $col = ($n || 1) - 1;
+        $col = 0 if $col < 0;
+    }
+}
+
+pos($buf) = 0;
+while (defined pos($buf) && pos($buf) < length($buf)) {
+    if ($buf =~ /\G\n/gc) { emit(); }
+    elsif ($buf =~ /\G\r/gc) { $col = 0; }
+    elsif ($buf =~ /\G\x08/gc) { $col-- if $col > 0; }
+    elsif ($buf =~ /\G\t/gc) { $col += 8 - ($col % 8); }
+    elsif ($buf =~ /\G[\x00-\x07\x0b\x0c\x0e-\x1a\x1c-\x1f\x7f]/gc) { }
+    elsif ($buf =~ /\G\e\[([\x30-\x3f]*)([\x20-\x2f]*)([\x40-\x7e])/gc) { csi($1, $2, $3); }
+    elsif ($buf =~ /\G\e\](?:[^\a\e]|\e(?!\\))*(?:\a|\e\\)/gc) { }
+    elsif ($buf =~ /\G\e[PX^_](?:[^\e]|\e(?!\\))*(?:\e\\)?/gc) { }
+    elsif ($buf =~ /\G\e[\(\)]./gc) { }
+    elsif ($buf =~ /\G\e\%./gc) { }
+    elsif ($buf =~ /\G\e./gc) { }
+    elsif ($buf =~ /\G(.)/sgc) { put($1); }
+    else { last; }
+}
+print join('', @line) if @line;
+PERL
+  then
     rm -f "$cleaned"
     die "cannot clean session log"
   fi

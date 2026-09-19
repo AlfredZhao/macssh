@@ -102,7 +102,7 @@ if "$project_dir/macssh" connect transfer extra >/dev/null 2>&1; then fail 'conn
 printf '%s\n' '#!/bin/bash' \
   'while [ $# -gt 0 ]; do case "$1" in -q|-a|-k|-e) shift ;; *) break ;; esac; done' \
   'file=$1; shift' \
-  'printf "hello\r\n\033[32mgreen\033[0m\nbell\a\n" > "$file"' \
+  'printf "hello\r\n\033[32mgreen\033[0m\nbell\a\nq ⠹0\rq ⠸0\rq ⠼0\n\033[0 qABC\rXYZ\n" > "$file"' \
   'exec "$@"' > "$fake_bin/script"
 chmod +x "$fake_bin/script"
 
@@ -114,6 +114,11 @@ log_file=$(printf '%s\n' "$log_output" | sed -n "s/.*Saved session log to '\\(.*
 [ -f "$log_file" ] || fail 'connect --log did not create log file'
 grep -Fq 'hello' "$log_file" || fail 'log omitted hello'
 grep -Fq 'green' "$log_file" || fail 'log omitted stripped color text'
+grep -Fq 'q ⠼0' "$log_file" || fail 'log omitted final spinner frame'
+grep -Fq 'XYZ' "$log_file" || fail 'log omitted overwritten status text'
+if grep -Fq '⠹' "$log_file"; then fail 'log kept intermediate spinner frame'; fi
+if grep -Fq '⠸' "$log_file"; then fail 'log kept intermediate spinner frame'; fi
+if grep -Fq 'ABC' "$log_file"; then fail 'log kept overwritten status text'; fi
 if grep -q $'\r' "$log_file"; then fail 'log still contains CR'; fi
 if grep -q $'\033' "$log_file"; then fail 'log still contains escape'; fi
 if grep -q $'\a' "$log_file"; then fail 'log still contains bell'; fi
