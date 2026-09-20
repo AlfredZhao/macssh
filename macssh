@@ -3,7 +3,7 @@
 # macssh - a tiny host manager built on top of macOS OpenSSH.
 set -u
 
-VERSION="0.3.2"
+VERSION="0.3.3"
 SSH_HOME="${MACSSH_HOME:-$HOME/.ssh}"
 CONFIG_FILE="${MACSSH_CONFIG:-$SSH_HOME/config.d/macssh.conf}"
 MAIN_CONFIG="${MACSSH_MAIN_CONFIG:-$SSH_HOME/config}"
@@ -407,12 +407,14 @@ sub leave_alt {
 sub csi {
     my ($params, $inter, $final) = @_;
     return if $inter ne '';
-    my $private = ($params =~ s/^\?//) ? 1 : 0;
-    my @p = map { $_ eq '' ? undef : 0 + $_ } split /;/, $params, -1;
+    my $private = ($params =~ s/^([?<=>])//) ? $1 : '';
+    my @p = map {
+        (!defined $_ || $_ eq '' || $_ !~ /^\d+\z/) ? undef : 0 + $_
+    } split /;/, $params, -1;
     my $n = (defined $p[0] && $p[0] > 0) ? $p[0] : 0;
     my $n1 = $n || 1;
 
-    if ($private && ($final eq 'h' || $final eq 'l')) {
+    if ($private ne '' && ($final eq 'h' || $final eq 'l')) {
         my $on = $final eq 'h';
         for my $mode (@p) {
             next unless defined $mode;
@@ -422,7 +424,7 @@ sub csi {
         }
         return;
     }
-    return if $private;
+    return if $private ne '';
 
     if ($final eq 'A') { $crow -= $n1; clamp_cursor(); }
     elsif ($final eq 'B') { $crow += $n1; clamp_cursor(); }
@@ -493,8 +495,9 @@ while (defined pos($buf) && pos($buf) < length($buf)) {
 }
 
 commit_screen();
-print join("\n", @history);
-print "\n" if @history;
+my @out = $alt ? (@pri_history, @history) : @history;
+print join("\n", @out);
+print "\n" if @out;
 PERL
   then
     rm -f "$cleaned"

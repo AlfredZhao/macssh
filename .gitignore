@@ -1,8 +1,8 @@
 # git code management
 scripts/
 
-›*
-:*
-tmp*
+# Codex sandbox sometimes materializes /tmp into the workspace.
+/:
+/tmp/
 core.*
 *.core

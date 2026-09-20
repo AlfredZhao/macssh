@@ -168,4 +168,17 @@ grep -Fq 'Hi — what would you like to work on?' "$tui_log" || fail 'TUI log om
 if grep -Fq 'loading-banner' "$tui_log"; then fail 'TUI log kept replaced frame'; fi
 unset SCRIPT_PAYLOAD
 
+# xterm/Codex private CSI prefixes such as >4 and <1 must not abort Perl
+# numeric conversion, and post-TUI shell output must still be logged.
+SCRIPT_PAYLOAD=$(printf '\033[?1049h\033[2J\033[Hcodex-tui\n\033[>4;1m\033[<1;2m\033[?1049lclosed.\nnew-os-command\n')
+export SCRIPT_PAYLOAD
+csi_output=$("$project_dir/macssh" connect transfer --log 2>"$test_root/csi.err")
+csi_log=$(printf '%s\n' "$csi_output" | sed -n "s/.*Saved session log to '\\(.*\\)'/\\1/p")
+[ -n "$csi_log" ] || fail 'CSI --log did not print log path'
+if grep -Fq "isn't numeric" "$test_root/csi.err"; then fail 'CSI prefixes caused Perl numeric warnings'; fi
+if grep -Fq 'Argument' "$test_root/csi.err"; then fail 'CSI prefixes caused Perl argument warnings'; fi
+grep -Fq 'closed.' "$csi_log" || fail 'CSI log omitted post-TUI closed text'
+grep -Fq 'new-os-command' "$csi_log" || fail 'CSI log omitted post-TUI shell output'
+unset SCRIPT_PAYLOAD
+
 printf 'All tests passed.\n'
