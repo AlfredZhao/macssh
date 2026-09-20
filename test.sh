@@ -99,11 +99,40 @@ if ls "$MACSSH_LOG_DIR"/*.log >/dev/null 2>&1; then fail 'connect without --log 
 if "$project_dir/macssh" connect transfer --verbose >/dev/null 2>&1; then fail 'connect unknown option succeeded'; fi
 if "$project_dir/macssh" connect transfer extra >/dev/null 2>&1; then fail 'connect extra arg succeeded'; fi
 
-printf '%s\n' '#!/bin/bash' \
-  'while [ $# -gt 0 ]; do case "$1" in -q|-a|-k|-e) shift ;; *) break ;; esac; done' \
-  'file=$1; shift' \
-  'printf "hello\r\n\033[32mgreen\033[0m\nbell\a\nq ⠹0\rq ⠸0\rq ⠼0\n\033[0 qABC\rXYZ\n" > "$file"' \
-  'exec "$@"' > "$fake_bin/script"
+cat > "$fake_bin/script" << 'SCRIPT'
+#!/bin/bash
+file=""
+extra=""
+cmd=()
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -q|-a|-k|-e|--quiet|--append|--return|--flush) shift ;;
+    -c|--command) extra="$2"; shift 2 ;;
+    *)
+      if [ -z "$file" ]; then
+        file="$1"
+      else
+        cmd+=("$1")
+      fi
+      shift
+      ;;
+  esac
+done
+[ -n "$file" ] || exit 1
+if [ -n "${SCRIPT_PAYLOAD:-}" ]; then
+  printf '%s' "$SCRIPT_PAYLOAD" > "$file"
+else
+  printf 'hello\r\n\033[32mgreen\033[0m\nbell\a\nq ⠹0\rq ⠸0\rq ⠼0\n\033[0 qABC\rXYZ\n' > "$file"
+fi
+if [ -n "$extra" ]; then
+  case "$extra" in
+    stty\ *) extra=${extra#*; } ;;
+  esac
+  eval "$extra"
+elif [ "${#cmd[@]}" -gt 0 ]; then
+  "${cmd[@]}"
+fi
+SCRIPT
 chmod +x "$fake_bin/script"
 
 log_output=$("$project_dir/macssh" connect transfer --log)
@@ -127,5 +156,16 @@ grep -Fq 'transfer' "$SSH_LOG" || fail 'connect --log did not pass ssh host'
 "$project_dir/macssh" connect --log transfer >/dev/null
 log_count=$(find "$MACSSH_LOG_DIR" -name 'transfer-*.log' | wc -l)
 [ "$log_count" -eq 2 ] || fail "expected 2 session logs, got $log_count"
+
+SCRIPT_PAYLOAD=$(printf '\033[2J\033[Hloading-banner\n\033[2J\033[Hfinal-banner\n\n› hi\n\n• Hi — what would you like to work on?\n')
+export SCRIPT_PAYLOAD
+tui_output=$("$project_dir/macssh" connect transfer --log)
+tui_log=$(printf '%s\n' "$tui_output" | sed -n "s/.*Saved session log to '\\(.*\\)'/\\1/p")
+[ -n "$tui_log" ] || fail 'TUI --log did not print log path'
+grep -Fq 'final-banner' "$tui_log" || fail 'TUI log omitted redrawn frame'
+grep -Fq '› hi' "$tui_log" || fail 'TUI log omitted prompt after redraw'
+grep -Fq 'Hi — what would you like to work on?' "$tui_log" || fail 'TUI log omitted assistant text'
+if grep -Fq 'loading-banner' "$tui_log"; then fail 'TUI log kept replaced frame'; fi
+unset SCRIPT_PAYLOAD
 
 printf 'All tests passed.\n'

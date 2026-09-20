@@ -3,7 +3,7 @@
 # macssh - a tiny host manager built on top of macOS OpenSSH.
 set -u
 
-VERSION="0.3.1"
+VERSION="0.3.2"
 SSH_HOME="${MACSSH_HOME:-$HOME/.ssh}"
 CONFIG_FILE="${MACSSH_CONFIG:-$SSH_HOME/config.d/macssh.conf}"
 MAIN_CONFIG="${MACSSH_MAIN_CONFIG:-$SSH_HOME/config}"
@@ -259,10 +259,15 @@ resolve_host() {
 }
 
 write_readable_log() {
-  local raw="$1" log="$2" cleaned
+  local raw="$1" log="$2" cleaned cols rows
   cleaned=$(mktemp "${TMPDIR:-/tmp}/macssh.XXXXXX") || die "cannot create temporary log"
-  # Replay in-place updates (CR/erase/cursor) so spinner and TUI frames collapse.
-  if ! perl - "$raw" > "$cleaned" <<'PERL'
+  cols=$(stty size 2>/dev/null | awk '{print $2}')
+  rows=$(stty size 2>/dev/null | awk '{print $1}')
+  cols=${cols:-${COLUMNS:-80}}
+  rows=${rows:-${LINES:-24}}
+  # Replay the recorded PTY as a screen so full-screen TUIs collapse to the
+  # last visible frame instead of concatenating every cursor move.
+  if ! MACSSH_COLS="$cols" MACSSH_ROWS="$rows" perl - "$raw" > "$cleaned" <<'PERL'
 use strict;
 use warnings;
 use Encode qw(decode);
@@ -272,65 +277,211 @@ my $raw = do { local $/; open my $fh, '<:raw', $ARGV[0] or die $!; <$fh> };
 $raw = '' unless defined $raw;
 my $buf = decode('UTF-8', $raw, Encode::FB_DEFAULT);
 $buf =~ s/\r\n/\n/g;
+$buf =~ s/^Script started on [^\n]*\n//;
+$buf =~ s/\nScript done on [^\n]*\z//;
 
-my @line;
-my $col = 0;
+my $cols = 0 + ($ENV{MACSSH_COLS} || $ENV{COLUMNS} || 80);
+my $rows = 0 + ($ENV{MACSSH_ROWS} || $ENV{LINES} || 24);
+$cols = 80 if $cols < 20;
+$cols = 400 if $cols > 400;
+$rows = 24 if $rows < 5;
+$rows = 200 if $rows > 200;
 
-sub emit {
-    print join('', @line), "\n";
-    @line = ();
-    $col = 0;
+sub blank_row { [ (' ') x $cols ] }
+sub clone_row { [ @{$_[0]} ] }
+sub clone_screen { [ map { clone_row($_) } @{$_[0]} ] }
+
+my @screen = map { blank_row() } 1 .. $rows;
+my @history;
+my ($crow, $ccol) = (0, 0);
+my ($saved_row, $saved_col) = (0, 0);
+my $alt = 0;
+my @pri_screen;
+my @pri_history;
+my ($pri_row, $pri_col) = (0, 0);
+
+sub row_text {
+    my ($r) = @_;
+    my $s = join('', map { (defined $_ && $_ ne '') ? $_ : ' ' } @$r);
+    $s =~ s/ +\z//;
+    return $s;
+}
+
+sub screen_lines {
+    my @lines = map { row_text($_) } @screen;
+    while (@lines && $lines[-1] eq '') { pop @lines }
+    return @lines;
+}
+
+sub commit_screen {
+    my @lines = screen_lines();
+    push @history, @lines if @lines;
+}
+
+sub chwidth {
+    my $o = ord($_[0]);
+    return 0 if $o < 32;
+    return 2 if $o >= 0x1100 && (
+        $o <= 0x115F || $o == 0x2329 || $o == 0x232A
+        || ($o >= 0x2E80 && $o <= 0xA4CF && $o != 0x303F)
+        || ($o >= 0xAC00 && $o <= 0xD7A3)
+        || ($o >= 0xF900 && $o <= 0xFAFF)
+        || ($o >= 0xFE10 && $o <= 0xFE19)
+        || ($o >= 0xFE30 && $o <= 0xFE6F)
+        || ($o >= 0xFF00 && $o <= 0xFF60)
+        || ($o >= 0xFFE0 && $o <= 0xFFE6)
+        || ($o >= 0x1F300)
+    );
+    return 1;
+}
+
+sub clamp_cursor {
+    $crow = 0 if $crow < 0;
+    $crow = $rows - 1 if $crow >= $rows;
+    $ccol = 0 if $ccol < 0;
+    $ccol = $cols - 1 if $ccol >= $cols;
+}
+
+sub scroll_up {
+    push @history, row_text($screen[0]);
+    shift @screen;
+    push @screen, blank_row();
+}
+
+sub newline {
+    $ccol = 0;
+    if ($crow >= $rows - 1) {
+        scroll_up();
+        $crow = $rows - 1;
+    } else {
+        $crow++;
+    }
 }
 
 sub put {
     my ($ch) = @_;
-    while (@line < $col) {
-        push @line, ' ';
+    my $w = chwidth($ch);
+    return if $w <= 0;
+    if ($ccol + $w > $cols) { newline(); }
+    if ($ccol > 0 && defined $screen[$crow][$ccol] && $screen[$crow][$ccol] eq '') {
+        $screen[$crow][$ccol - 1] = ' ' if $ccol - 1 >= 0;
     }
-    if ($col == @line) {
-        push @line, $ch;
-    } else {
-        $line[$col] = $ch;
+    $screen[$crow][$ccol] = $ch;
+    if ($w == 2 && $ccol + 1 < $cols) {
+        $screen[$crow][$ccol + 1] = '';
     }
-    $col++;
+    $ccol += $w;
+    $ccol = $cols if $ccol > $cols;
+}
+
+sub erase_cells {
+    my ($r, $from, $to) = @_;
+    $from = 0 if $from < 0;
+    $to = $cols - 1 if $to >= $cols;
+    return if $to < $from;
+    for my $i ($from .. $to) { $screen[$r][$i] = ' '; }
+}
+
+sub enter_alt {
+    return if $alt;
+    @pri_screen = @{ clone_screen(\@screen) };
+    @pri_history = @history;
+    ($pri_row, $pri_col) = ($crow, $ccol);
+    @screen = map { blank_row() } 1 .. $rows;
+    @history = ();
+    ($crow, $ccol) = (0, 0);
+    $alt = 1;
+}
+
+sub leave_alt {
+    return unless $alt;
+    commit_screen();
+    my @alt_hist = @history;
+    @screen = @pri_screen ? @{ clone_screen(\@pri_screen) } : map { blank_row() } 1 .. $rows;
+    @history = (@pri_history, @alt_hist);
+    ($crow, $ccol) = ($pri_row, $pri_col);
+    $alt = 0;
+    clamp_cursor();
 }
 
 sub csi {
     my ($params, $inter, $final) = @_;
     return if $inter ne '';
-    my $n = 0;
-    if ($params =~ /^(\d+)/) {
-        $n = 0 + $1;
-    }
-    if ($final eq 'K') {
-        $n = 0 if $params eq '';
-        if ($n == 2) {
-            @line = ();
-        } elsif ($n == 1) {
-            for my $i (0 .. $col - 1) {
-                $line[$i] = ' ' if $i < @line;
+    my $private = ($params =~ s/^\?//) ? 1 : 0;
+    my @p = map { $_ eq '' ? undef : 0 + $_ } split /;/, $params, -1;
+    my $n = (defined $p[0] && $p[0] > 0) ? $p[0] : 0;
+    my $n1 = $n || 1;
+
+    if ($private && ($final eq 'h' || $final eq 'l')) {
+        my $on = $final eq 'h';
+        for my $mode (@p) {
+            next unless defined $mode;
+            if ($mode == 1049 || $mode == 47 || $mode == 1047) {
+                $on ? enter_alt() : leave_alt();
             }
-        } elsif ($col < @line) {
-            splice @line, $col;
         }
-    } elsif ($final eq 'C') {
-        $col += ($n || 1);
-    } elsif ($final eq 'D') {
-        $col -= ($n || 1);
-        $col = 0 if $col < 0;
-    } elsif ($final eq 'G') {
-        $col = ($n || 1) - 1;
-        $col = 0 if $col < 0;
+        return;
     }
+    return if $private;
+
+    if ($final eq 'A') { $crow -= $n1; clamp_cursor(); }
+    elsif ($final eq 'B') { $crow += $n1; clamp_cursor(); }
+    elsif ($final eq 'C') { $ccol += $n1; clamp_cursor(); }
+    elsif ($final eq 'D') { $ccol -= $n1; clamp_cursor(); }
+    elsif ($final eq 'E') { $crow += $n1; $ccol = 0; clamp_cursor(); }
+    elsif ($final eq 'F') { $crow -= $n1; $ccol = 0; clamp_cursor(); }
+    elsif ($final eq 'G') { $ccol = ($n || 1) - 1; clamp_cursor(); }
+    elsif ($final eq 'd') { $crow = ($n || 1) - 1; clamp_cursor(); }
+    elsif ($final eq 'H' || $final eq 'f') {
+        my $r = (defined $p[0] && $p[0] > 0) ? $p[0] : 1;
+        my $c = (defined $p[1] && $p[1] > 0) ? $p[1] : 1;
+        $crow = $r - 1;
+        $ccol = $c - 1;
+        clamp_cursor();
+    }
+    elsif ($final eq 'J') {
+        my $m = defined $p[0] ? $p[0] : 0;
+        if ($m == 2 || $m == 3) {
+            @screen = map { blank_row() } 1 .. $rows;
+        } elsif ($m == 1) {
+            erase_cells($crow, 0, $ccol);
+            for my $r (0 .. $crow - 1) { $screen[$r] = blank_row(); }
+        } else {
+            erase_cells($crow, $ccol, $cols - 1);
+            for my $r ($crow + 1 .. $rows - 1) { $screen[$r] = blank_row(); }
+        }
+    }
+    elsif ($final eq 'K') {
+        my $m = defined $p[0] ? $p[0] : 0;
+        if ($m == 2) { $screen[$crow] = blank_row(); }
+        elsif ($m == 1) { erase_cells($crow, 0, $ccol); }
+        else { erase_cells($crow, $ccol, $cols - 1); }
+    }
+    elsif ($final eq 's') { ($saved_row, $saved_col) = ($crow, $ccol); }
+    elsif ($final eq 'u') { ($crow, $ccol) = ($saved_row, $saved_col); clamp_cursor(); }
 }
 
 pos($buf) = 0;
 while (defined pos($buf) && pos($buf) < length($buf)) {
-    if ($buf =~ /\G\n/gc) { emit(); }
-    elsif ($buf =~ /\G\r/gc) { $col = 0; }
-    elsif ($buf =~ /\G\x08/gc) { $col-- if $col > 0; }
-    elsif ($buf =~ /\G\t/gc) { $col += 8 - ($col % 8); }
+    if ($buf =~ /\G\n/gc) { newline(); }
+    elsif ($buf =~ /\G\r/gc) { $ccol = 0; }
+    elsif ($buf =~ /\G\x08/gc) { $ccol-- if $ccol > 0; }
+    elsif ($buf =~ /\G\t/gc) {
+        $ccol += 8 - ($ccol % 8);
+        $ccol = $cols - 1 if $ccol >= $cols;
+    }
     elsif ($buf =~ /\G[\x00-\x07\x0b\x0c\x0e-\x1a\x1c-\x1f\x7f]/gc) { }
+    elsif ($buf =~ /\G\e7/gc) { ($saved_row, $saved_col) = ($crow, $ccol); }
+    elsif ($buf =~ /\G\e8/gc) { ($crow, $ccol) = ($saved_row, $saved_col); clamp_cursor(); }
+    elsif ($buf =~ /\G\eM/gc) {
+        if ($crow > 0) { $crow--; }
+        else { pop @screen; unshift @screen, blank_row(); }
+    }
+    elsif ($buf =~ /\G\eD/gc) {
+        if ($crow >= $rows - 1) { scroll_up(); }
+        else { $crow++; }
+    }
+    elsif ($buf =~ /\G\eE/gc) { newline(); }
     elsif ($buf =~ /\G\e\[([\x30-\x3f]*)([\x20-\x2f]*)([\x40-\x7e])/gc) { csi($1, $2, $3); }
     elsif ($buf =~ /\G\e\](?:[^\a\e]|\e(?!\\))*(?:\a|\e\\)/gc) { }
     elsif ($buf =~ /\G\e[PX^_](?:[^\e]|\e(?!\\))*(?:\e\\)?/gc) { }
@@ -340,22 +491,23 @@ while (defined pos($buf) && pos($buf) < length($buf)) {
     elsif ($buf =~ /\G(.)/sgc) { put($1); }
     else { last; }
 }
-print join('', @line) if @line;
+
+commit_screen();
+print join("\n", @history);
+print "\n" if @history;
 PERL
   then
     rm -f "$cleaned"
     die "cannot clean session log"
   fi
-  if ! col -b < "$cleaned" > "$log" 2>/dev/null; then
-    cp "$cleaned" "$log" || die "cannot write $log"
-  fi
+  cp "$cleaned" "$log" || die "cannot write $log"
   rm -f "$cleaned"
   chmod 600 "$log" 2>/dev/null || true
 }
 
 connect_with_log() {
   local name="$1" stamp raw log status=0 i=1
-  command -v script >/dev/null 2>&1 || die "--log requires the macOS script command"
+  command -v script >/dev/null 2>&1 || die "--log requires the script command"
   command -v perl >/dev/null 2>&1 || die "--log requires perl"
   mkdir -p "$LOG_DIR" || die "cannot create $LOG_DIR"
   chmod 700 "$LOG_DIR" 2>/dev/null || true
@@ -366,8 +518,20 @@ connect_with_log() {
     i=$((i + 1))
   done
   raw=$(mktemp "${TMPDIR:-/tmp}/macssh.XXXXXX") || die "cannot create temporary log"
+  if size=$(stty size 2>/dev/null); then
+    export LINES=${size% *}
+    export COLUMNS=${size#* }
+  fi
   printf "Logging to '%s'\n" "$log"
-  script -q "$raw" ssh "$name" || status=$?
+  if [ "$(uname -s)" = Linux ]; then
+    if [ -n "${LINES:-}" ] && [ -n "${COLUMNS:-}" ]; then
+      script -q -e -c "stty rows ${LINES} cols ${COLUMNS} 2>/dev/null; exec ssh $(printf '%q' "$name")" "$raw" || status=$?
+    else
+      script -q -e -c "ssh $(printf '%q' "$name")" "$raw" || status=$?
+    fi
+  else
+    script -q "$raw" ssh "$name" || status=$?
+  fi
   write_readable_log "$raw" "$log"
   rm -f "$raw"
   printf "Saved session log to '%s'\n" "$log"
