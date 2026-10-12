@@ -91,6 +91,18 @@ macssh get prod /opt/app/dist ./dist
 
 省略远端路径时，文件传到远端家目录；省略本地路径时，下载到当前目录。文件夹会递归复制，跳板机同样生效。
 
+下载支持远端通配符；请用单引号包裹模式，避免被本地 Shell 提前处理：
+
+```bash
+macssh get prod '/var/log/xx*.zip' ./downloads/
+```
+
+`put` 目前仅支持上传单个本地文件或目录，不支持本地通配符或一次上传多个本地文件。批量上传可直接使用原生 `scp`：
+
+```bash
+scp ./xx*.zip prod:/tmp/
+```
+
 `upload` / `download` 是 `put` / `get` 的别名。大目录增量同步仍可直接用 `rsync`。
 
 ## 6. 使用原生 SSH 工具
