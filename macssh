@@ -3,11 +3,12 @@
 # macssh - a tiny host manager built on top of macOS OpenSSH.
 set -u
 
-VERSION="0.3.3"
+VERSION="0.4.0"
 SSH_HOME="${MACSSH_HOME:-$HOME/.ssh}"
 CONFIG_FILE="${MACSSH_CONFIG:-$SSH_HOME/config.d/macssh.conf}"
 MAIN_CONFIG="${MACSSH_MAIN_CONFIG:-$SSH_HOME/config}"
 LOG_DIR="${MACSSH_LOG_DIR:-$HOME/ssh-logs}"
+TUNNEL_DIR="${MACSSH_TUNNEL_DIR:-$SSH_HOME/macssh-tunnels}"
 
 die() {
   printf 'macssh: %s\n' "$*" >&2
@@ -21,6 +22,12 @@ Usage:
   macssh add [name] [options]    Add or update a host
   macssh list                    List managed hosts
   macssh connect [name] [--log]  Connect to a host
+  macssh tunnel [start] <name> <remote-port> [--local LOCAL_PORT]
+                                Start a background local port tunnel
+  macssh tunnel list             List active tunnels
+  macssh tunnel stop <name> <local-port>
+                                Stop a tunnel
+  macssh tunnel stop --all       Stop all managed tunnels
   macssh test <name>             Test authentication
   macssh put <name> <local> [remote]
                                 Upload a file or folder
@@ -42,6 +49,10 @@ Add options:
 
 Connect options:
   --log           Save a readable session log to ~/ssh-logs
+
+Tunnel options:
+  --local PORT    Local port (default: same as remote port)
+  --compress      Enable SSH compression
 EOF
 }
 
@@ -88,6 +99,32 @@ validate_value() {
 validate_port() {
   case "$1" in ''|*[!0-9]*) die "port must be a number" ;; esac
   [ "$1" -ge 1 ] 2>/dev/null && [ "$1" -le 65535 ] 2>/dev/null || die "port must be between 1 and 65535"
+}
+
+init_tunnel_dir() {
+  mkdir -p "$TUNNEL_DIR" || die "cannot create $TUNNEL_DIR"
+  chmod 700 "$TUNNEL_DIR" 2>/dev/null || true
+}
+
+tunnel_state_file() {
+  printf '%s/%s-%s.state' "$TUNNEL_DIR" "$1" "$2"
+}
+
+tunnel_control_file() {
+  printf '%s/%s-%s.sock' "$TUNNEL_DIR" "$1" "$2"
+}
+
+tunnel_is_running() {
+  ssh -S "$2" -O check "$1" >/dev/null 2>&1
+}
+
+read_tunnel_state() {
+  TUNNEL_NAME=$(sed -n '1p' "$1")
+  TUNNEL_LOCAL_PORT=$(sed -n '2p' "$1")
+  TUNNEL_REMOTE_PORT=$(sed -n '3p' "$1")
+  TUNNEL_CONTROL=$(sed -n '4p' "$1")
+  [ -n "$TUNNEL_NAME" ] && [ -n "$TUNNEL_LOCAL_PORT" ] \
+    && [ -n "$TUNNEL_REMOTE_PORT" ] && [ -n "$TUNNEL_CONTROL" ]
 }
 
 host_exists() {
@@ -554,11 +591,164 @@ cmd_connect() {
         ;;
     esac
   done
-  name=$(resolve_host "$name")
+  if ! name=$(resolve_host "$name"); then
+    return 1
+  fi
   if [ "$enable_log" -eq 0 ]; then
     exec ssh "$name"
   fi
   connect_with_log "$name"
+}
+
+cmd_tunnel_start() {
+  local name remote_port local_port="" compress=0 state control tmp candidate
+  [ "${1:-}" != "start" ] || shift
+  [ $# -ge 2 ] || die "usage: macssh tunnel [start] <name> <remote-port> [--local LOCAL_PORT] [--compress]"
+  name="$1"
+  remote_port="$2"
+  shift 2
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --local)
+        [ $# -ge 2 ] || die "--local requires a port"
+        local_port="$2"
+        shift 2
+        ;;
+      --compress) compress=1; shift ;;
+      *) die "unknown tunnel option: $1" ;;
+    esac
+  done
+
+  if ! name=$(resolve_host "$name"); then
+    return 1
+  fi
+  validate_port "$remote_port"
+  local_port=${local_port:-$remote_port}
+  validate_port "$local_port"
+  init_tunnel_dir
+
+  # A local listening port can only belong to one tunnel. Remove stale state
+  # before reporting a conflict with another managed tunnel.
+  for candidate in "$TUNNEL_DIR"/*.state; do
+    [ -e "$candidate" ] || continue
+    if ! read_tunnel_state "$candidate"; then
+      rm -f "$candidate"
+      continue
+    fi
+    if [ "$TUNNEL_LOCAL_PORT" = "$local_port" ]; then
+      if tunnel_is_running "$TUNNEL_NAME" "$TUNNEL_CONTROL"; then
+        die "local port $local_port is already used by tunnel '$TUNNEL_NAME'"
+      fi
+      rm -f "$candidate" "$TUNNEL_CONTROL"
+    fi
+  done
+
+  state=$(tunnel_state_file "$name" "$local_port")
+  control=$(tunnel_control_file "$name" "$local_port")
+  # macOS limits Unix-domain socket paths. Fail with an actionable message
+  # instead of exposing OpenSSH's less obvious "too long" error.
+  [ ${#control} -lt 100 ] || die "tunnel path is too long; set MACSSH_TUNNEL_DIR to a shorter directory"
+  if [ -e "$control" ]; then
+    if tunnel_is_running "$name" "$control"; then
+      die "a tunnel control socket already exists for '$name' on local port $local_port"
+    fi
+    rm -f "$control"
+  fi
+
+  tmp=$(mktemp "$TUNNEL_DIR/.state.XXXXXX") || die "cannot create tunnel state"
+  {
+    printf '%s\n' "$name"
+    printf '%s\n' "$local_port"
+    printf '%s\n' "$remote_port"
+    printf '%s\n' "$control"
+  } > "$tmp" || { rm -f "$tmp"; die "cannot write tunnel state"; }
+  chmod 600 "$tmp" 2>/dev/null || true
+
+  if [ "$compress" -eq 1 ]; then
+    ssh -M -S "$control" -f -N -T -C \
+      -o ExitOnForwardFailure=yes -o ControlPersist=no \
+      -L "127.0.0.1:${local_port}:127.0.0.1:${remote_port}" "$name" \
+      || { rm -f "$tmp" "$control"; die "cannot start tunnel"; }
+  else
+    ssh -M -S "$control" -f -N -T \
+      -o ExitOnForwardFailure=yes -o ControlPersist=no \
+      -L "127.0.0.1:${local_port}:127.0.0.1:${remote_port}" "$name" \
+      || { rm -f "$tmp" "$control"; die "cannot start tunnel"; }
+  fi
+  if ! mv "$tmp" "$state"; then
+    ssh -S "$control" -O exit "$name" >/dev/null 2>&1 || true
+    rm -f "$tmp" "$control"
+    die "cannot save tunnel state"
+  fi
+  printf "Started tunnel '%s': 127.0.0.1:%s -> 127.0.0.1:%s\n" "$name" "$local_port" "$remote_port"
+}
+
+cmd_tunnel_list() {
+  local state count=0
+  init_tunnel_dir
+  printf '%-22s %-23s %-23s %s\n' HOST LOCAL REMOTE STATUS
+  for state in "$TUNNEL_DIR"/*.state; do
+    [ -e "$state" ] || continue
+    if ! read_tunnel_state "$state"; then
+      rm -f "$state"
+      continue
+    fi
+    if tunnel_is_running "$TUNNEL_NAME" "$TUNNEL_CONTROL"; then
+      printf '%-22s %-23s %-23s %s\n' "$TUNNEL_NAME" "127.0.0.1:$TUNNEL_LOCAL_PORT" \
+        "127.0.0.1:$TUNNEL_REMOTE_PORT" running
+      count=$((count + 1))
+    else
+      rm -f "$state" "$TUNNEL_CONTROL"
+    fi
+  done
+  [ "$count" -gt 0 ] || printf 'No active tunnels.\n'
+}
+
+stop_tunnel_state() {
+  local state="$1"
+  read_tunnel_state "$state" || { rm -f "$state"; die "invalid tunnel state: $state"; }
+  if tunnel_is_running "$TUNNEL_NAME" "$TUNNEL_CONTROL"; then
+    ssh -S "$TUNNEL_CONTROL" -O exit "$TUNNEL_NAME" >/dev/null \
+      || die "cannot stop tunnel '$TUNNEL_NAME' on local port $TUNNEL_LOCAL_PORT"
+    printf "Stopped tunnel '%s' on local port %s.\n" "$TUNNEL_NAME" "$TUNNEL_LOCAL_PORT"
+  else
+    printf "Removed stale tunnel '%s' on local port %s.\n" "$TUNNEL_NAME" "$TUNNEL_LOCAL_PORT"
+  fi
+  rm -f "$state" "$TUNNEL_CONTROL"
+}
+
+cmd_tunnel_stop() {
+  local state found=0 name local_port
+  init_tunnel_dir
+  shift
+  if [ "${1:-}" = "--all" ]; then
+    [ $# -eq 1 ] || die "usage: macssh tunnel stop --all"
+    for state in "$TUNNEL_DIR"/*.state; do
+      [ -e "$state" ] || continue
+      found=1
+      stop_tunnel_state "$state"
+    done
+    [ "$found" -eq 1 ] || printf 'No active tunnels.\n'
+    return
+  fi
+
+  [ $# -eq 2 ] || die "usage: macssh tunnel stop <name> <local-port>"
+  name="$1"
+  local_port="$2"
+  validate_name "$name"
+  validate_port "$local_port"
+  state=$(tunnel_state_file "$name" "$local_port")
+  [ -f "$state" ] || die "no managed tunnel for '$name' on local port $local_port"
+  stop_tunnel_state "$state"
+}
+
+cmd_tunnel() {
+  case "${1:-}" in
+    list|ls) [ $# -eq 1 ] || die "usage: macssh tunnel list"; cmd_tunnel_list ;;
+    stop|rm|kill) cmd_tunnel_stop "$@" ;;
+    '') die "usage: macssh tunnel [start] <name> <remote-port> [--local LOCAL_PORT]" ;;
+    *) cmd_tunnel_start "$@" ;;
+  esac
 }
 
 cmd_test() {
@@ -629,6 +819,7 @@ main() {
     list|ls) cmd_list "$@" ;;
     connect|ssh) cmd_connect "$@" ;;
     --log) cmd_connect --log "$@" ;;
+    tunnel|port) cmd_tunnel "$@" ;;
     test) cmd_test "$@" ;;
     put|upload) cmd_put "$@" ;;
     get|download) cmd_get "$@" ;;

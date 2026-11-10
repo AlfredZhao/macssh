@@ -9,6 +9,7 @@ export MACSSH_HOME="$test_root/.ssh"
 export MACSSH_CONFIG="$MACSSH_HOME/config.d/macssh.conf"
 export MACSSH_MAIN_CONFIG="$MACSSH_HOME/config"
 export MACSSH_LOG_DIR="$test_root/ssh-logs"
+export MACSSH_TUNNEL_DIR="$test_root/tunnels"
 
 fail() { printf 'FAIL: %s\n' "$*" >&2; exit 1; }
 assert_contains() { grep -Fq "$2" "$1" || fail "$1 does not contain: $2"; }
@@ -44,6 +45,7 @@ help_output=$("$project_dir/macssh" help)
 printf '%s' "$help_output" | grep -Fq 'macssh put' || fail 'help omitted put'
 printf '%s' "$help_output" | grep -Fq 'macssh get' || fail 'help omitted get'
 printf '%s' "$help_output" | grep -Fq -- '--log' || fail 'help omitted --log'
+printf '%s' "$help_output" | grep -Fq 'macssh tunnel' || fail 'help omitted tunnel'
 
 "$project_dir/macssh" add transfer --host example.com --user ubuntu --yes >/dev/null
 
@@ -79,7 +81,30 @@ if "$project_dir/macssh" test missing-host >/dev/null 2>&1; then fail 'test unkn
 
 export SSH_LOG="$test_root/ssh.log"
 export SSH_EXIT=0
-printf '%s\n' '#!/bin/bash' 'printf "%s\n" "$*" > "$SSH_LOG"' 'exit "${SSH_EXIT:-0}"' > "$fake_bin/ssh"
+cat > "$fake_bin/ssh" << 'SSH'
+#!/bin/bash
+printf '%s\n' "$*" > "$SSH_LOG"
+socket=""
+operation=""
+forward=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -S) socket="$2"; shift 2 ;;
+    -O) operation="$2"; shift 2 ;;
+    -L) forward="$2"; shift 2 ;;
+    *) shift ;;
+  esac
+done
+case "$operation" in
+  check) [ -n "$socket" ] && [ -e "$socket" ]; exit ;;
+  exit) [ -n "$socket" ] && rm -f "$socket"; exit "${SSH_EXIT:-0}" ;;
+esac
+if [ -n "$forward" ] && [ -n "$socket" ] && [ "${SSH_EXIT:-0}" -eq 0 ]; then
+  mkdir -p "$(dirname "$socket")"
+  : > "$socket"
+fi
+exit "${SSH_EXIT:-0}"
+SSH
 chmod +x "$fake_bin/ssh"
 
 test_ok=$("$project_dir/macssh" test transfer)
@@ -98,6 +123,51 @@ if ls "$MACSSH_LOG_DIR"/*.log >/dev/null 2>&1; then fail 'connect without --log 
 
 if "$project_dir/macssh" connect transfer --verbose >/dev/null 2>&1; then fail 'connect unknown option succeeded'; fi
 if "$project_dir/macssh" connect transfer extra >/dev/null 2>&1; then fail 'connect extra arg succeeded'; fi
+
+tunnel_output=$("$project_dir/macssh" tunnel transfer 5902)
+printf '%s' "$tunnel_output" | grep -Fq "127.0.0.1:5902 -> 127.0.0.1:5902" || fail 'tunnel omitted default mapping'
+grep -Fq -- '-M -S ' "$SSH_LOG" || fail 'tunnel did not create a control master'
+grep -Fq -- '-f -N -T' "$SSH_LOG" || fail 'tunnel did not run in background mode'
+grep -Fq -- '-o ExitOnForwardFailure=yes' "$SSH_LOG" || fail 'tunnel omitted forward failure checking'
+grep -Fq -- '-L 127.0.0.1:5902:127.0.0.1:5902 transfer' "$SSH_LOG" || fail 'tunnel passed the wrong default mapping'
+
+tunnel_list=$("$project_dir/macssh" tunnel list)
+printf '%s' "$tunnel_list" | grep -Fq transfer || fail 'tunnel list omitted host'
+printf '%s' "$tunnel_list" | grep -Fq '127.0.0.1:5902' || fail 'tunnel list omitted port'
+
+custom_output=$("$project_dir/macssh" port transfer 5903 --local 15903 --compress)
+printf '%s' "$custom_output" | grep -Fq '127.0.0.1:15903 -> 127.0.0.1:5903' || fail 'tunnel omitted custom mapping'
+grep -Fq -- '-f -N -T -C' "$SSH_LOG" || fail 'tunnel --compress omitted -C'
+grep -Fq -- '-L 127.0.0.1:15903:127.0.0.1:5903 transfer' "$SSH_LOG" || fail 'tunnel passed the wrong custom mapping'
+
+if "$project_dir/macssh" tunnel transfer 6000 --local 15903 >/dev/null 2>&1; then fail 'tunnel reused a managed local port'; fi
+if "$project_dir/macssh" tunnel missing-host 5904 >/dev/null 2>&1; then fail 'tunnel accepted an unknown host'; fi
+if "$project_dir/macssh" tunnel transfer 70000 >/dev/null 2>&1; then fail 'tunnel accepted an invalid remote port'; fi
+if "$project_dir/macssh" tunnel transfer 5904 --local 0 >/dev/null 2>&1; then fail 'tunnel accepted an invalid local port'; fi
+
+stop_output=$("$project_dir/macssh" tunnel kill transfer 15903)
+printf '%s' "$stop_output" | grep -Fq "Stopped tunnel 'transfer'" || fail 'tunnel stop omitted confirmation'
+if "$project_dir/macssh" tunnel stop transfer 15903 >/dev/null 2>&1; then fail 'tunnel stopped a missing mapping'; fi
+
+# An SSH process that disappears outside macssh should be removed from list.
+rm -f "$MACSSH_TUNNEL_DIR/transfer-5902.sock"
+stale_list=$("$project_dir/macssh" tunnel list)
+printf '%s' "$stale_list" | grep -Fq 'No active tunnels.' || fail 'tunnel list kept stale mapping'
+[ ! -e "$MACSSH_TUNNEL_DIR/transfer-5902.state" ] || fail 'tunnel list kept stale state file'
+
+SSH_EXIT=1
+if "$project_dir/macssh" tunnel transfer 5907 >/dev/null 2>&1; then fail 'tunnel succeeded when ssh failed'; fi
+[ ! -e "$MACSSH_TUNNEL_DIR/transfer-5907.state" ] || fail 'failed tunnel left a state file'
+[ ! -e "$MACSSH_TUNNEL_DIR/transfer-5907.sock" ] || fail 'failed tunnel left a control file'
+SSH_EXIT=0
+
+"$project_dir/macssh" tunnel start transfer 5905 >/dev/null
+"$project_dir/macssh" tunnel transfer 5906 >/dev/null
+stop_all_output=$("$project_dir/macssh" tunnel stop --all)
+printf '%s' "$stop_all_output" | grep -Fq '5905' || fail 'tunnel stop --all omitted first mapping'
+printf '%s' "$stop_all_output" | grep -Fq '5906' || fail 'tunnel stop --all omitted second mapping'
+empty_list=$("$project_dir/macssh" tunnel list)
+printf '%s' "$empty_list" | grep -Fq 'No active tunnels.' || fail 'tunnel stop --all left mappings'
 
 cat > "$fake_bin/script" << 'SCRIPT'
 #!/bin/bash

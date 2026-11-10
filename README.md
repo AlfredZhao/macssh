@@ -78,7 +78,33 @@ macssh edit prod       # 修改，直接回车保留原值
 macssh remove prod     # 删除，执行前要求确认
 ```
 
-## 5. 上传和下载
+## 5. 后台端口映射
+
+将本机端口映射到远程主机的 `127.0.0.1`：
+
+```bash
+# 本机 5902 -> prod 主机的 127.0.0.1:5902
+macssh tunnel prod 5902
+
+# 本机 15902 -> prod 主机的 127.0.0.1:5902
+macssh tunnel prod 5902 --local 15902
+```
+
+隧道连接成功后自动在后台运行，不占用当前终端。需要 SSH 压缩时可以增加 `--compress`。
+
+查看和停止由 macssh 启动的隧道：
+
+```bash
+macssh tunnel list
+macssh tunnel stop prod 15902
+macssh tunnel stop --all
+```
+
+`port` 是 `tunnel` 的简写，例如 `macssh port prod 5902`。映射只监听本机
+`127.0.0.1`，不会直接暴露到局域网。状态文件保存在
+`~/.ssh/macssh-tunnels/`。`kill` 也可以作为 `stop` 的别名。
+
+## 6. 上传和下载
 
 在本机再开一个终端标签页即可传输，不必断开当前 SSH。
 
@@ -105,7 +131,7 @@ scp ./xx*.zip prod:/tmp/
 
 `upload` / `download` 是 `put` / `get` 的别名。大目录增量同步仍可直接用 `rsync`。
 
-## 6. 使用原生 SSH 工具
+## 7. 使用原生 SSH 工具
 
 `macssh` 生成标准 OpenSSH 配置，因此也可以直接使用：
 
@@ -115,7 +141,7 @@ scp local.txt prod:/tmp/
 sftp prod
 ```
 
-## 7. 配置文件
+## 8. 配置文件
 
 主机配置保存在：
 
@@ -134,13 +160,17 @@ macssh path            # 查看配置文件路径
 macssh config          # 编辑原始 SSH 配置
 ```
 
-## 8. 命令速查
+## 9. 命令速查
 
 ```text
 macssh                  选择并连接主机
 macssh add [名称]       添加主机
 macssh list             查看主机
 macssh connect [名称] [--log]  连接主机，可选记录会话日志
+macssh tunnel <名称> <远程端口> [--local 本地端口]  启动后台端口映射
+macssh tunnel list              查看活动端口映射
+macssh tunnel stop <名称> <本地端口>  停止端口映射
+macssh tunnel stop --all        停止全部端口映射
 macssh test <名称>      测试 Key 登录
 macssh put <名称> <本地> [远端]   上传文件或文件夹
 macssh get <名称> <远端> [本地]   下载文件或文件夹
