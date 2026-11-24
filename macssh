@@ -3,7 +3,7 @@
 # macssh - a tiny host manager built on top of macOS OpenSSH.
 set -u
 
-VERSION="0.4.0"
+VERSION="0.5.0"
 SSH_HOME="${MACSSH_HOME:-$HOME/.ssh}"
 CONFIG_FILE="${MACSSH_CONFIG:-$SSH_HOME/config.d/macssh.conf}"
 MAIN_CONFIG="${MACSSH_MAIN_CONFIG:-$SSH_HOME/config}"
@@ -22,7 +22,7 @@ Usage:
   macssh add [name] [options]    Add or update a host
   macssh list                    List managed hosts
   macssh connect [name] [--log]  Connect to a host
-  macssh tunnel [start] <name> <remote-port> [--local LOCAL_PORT]
+  macssh tunnel [start] <name> <remote-port> [--local LOCAL_PORT] [--bind ADDRESS]
                                 Start a background local port tunnel
   macssh tunnel list             List active tunnels
   macssh tunnel stop <name> <local-port>
@@ -52,6 +52,7 @@ Connect options:
 
 Tunnel options:
   --local PORT    Local port (default: same as remote port)
+  --bind ADDRESS  Local IPv4 address to listen on (default: 127.0.0.1)
   --compress      Enable SSH compression
 EOF
 }
@@ -101,6 +102,25 @@ validate_port() {
   [ "$1" -ge 1 ] 2>/dev/null && [ "$1" -le 65535 ] 2>/dev/null || die "port must be between 1 and 65535"
 }
 
+validate_ipv4() {
+  local address="$1" part rest count=0
+  case "$address" in
+    ''|.*|*.|*..*|*[!0-9.]*) die "bind address must be an IPv4 address" ;;
+  esac
+  rest="$address"
+  while :; do
+    case "$rest" in
+      *.*) part=${rest%%.*}; rest=${rest#*.} ;;
+      *) part=$rest; rest="" ;;
+    esac
+    case "$part" in ''|*[!0-9]*) die "bind address must be an IPv4 address" ;; esac
+    [ "$part" -le 255 ] 2>/dev/null || die "bind address must be an IPv4 address"
+    count=$((count + 1))
+    [ -n "$rest" ] || break
+  done
+  [ "$count" -eq 4 ] || die "bind address must be an IPv4 address"
+}
+
 init_tunnel_dir() {
   mkdir -p "$TUNNEL_DIR" || die "cannot create $TUNNEL_DIR"
   chmod 700 "$TUNNEL_DIR" 2>/dev/null || true
@@ -123,6 +143,8 @@ read_tunnel_state() {
   TUNNEL_LOCAL_PORT=$(sed -n '2p' "$1")
   TUNNEL_REMOTE_PORT=$(sed -n '3p' "$1")
   TUNNEL_CONTROL=$(sed -n '4p' "$1")
+  TUNNEL_BIND_ADDRESS=$(sed -n '5p' "$1")
+  TUNNEL_BIND_ADDRESS=${TUNNEL_BIND_ADDRESS:-127.0.0.1}
   [ -n "$TUNNEL_NAME" ] && [ -n "$TUNNEL_LOCAL_PORT" ] \
     && [ -n "$TUNNEL_REMOTE_PORT" ] && [ -n "$TUNNEL_CONTROL" ]
 }
@@ -601,9 +623,9 @@ cmd_connect() {
 }
 
 cmd_tunnel_start() {
-  local name remote_port local_port="" compress=0 state control tmp candidate
+  local name remote_port local_port="" bind_address="127.0.0.1" compress=0 state control tmp candidate
   [ "${1:-}" != "start" ] || shift
-  [ $# -ge 2 ] || die "usage: macssh tunnel [start] <name> <remote-port> [--local LOCAL_PORT] [--compress]"
+  [ $# -ge 2 ] || die "usage: macssh tunnel [start] <name> <remote-port> [--local LOCAL_PORT] [--bind ADDRESS] [--compress]"
   name="$1"
   remote_port="$2"
   shift 2
@@ -612,6 +634,11 @@ cmd_tunnel_start() {
       --local)
         [ $# -ge 2 ] || die "--local requires a port"
         local_port="$2"
+        shift 2
+        ;;
+      --bind)
+        [ $# -ge 2 ] || die "--bind requires an IPv4 address"
+        bind_address="$2"
         shift 2
         ;;
       --compress) compress=1; shift ;;
@@ -625,6 +652,7 @@ cmd_tunnel_start() {
   validate_port "$remote_port"
   local_port=${local_port:-$remote_port}
   validate_port "$local_port"
+  validate_ipv4 "$bind_address"
   init_tunnel_dir
 
   # A local listening port can only belong to one tunnel. Remove stale state
@@ -661,18 +689,19 @@ cmd_tunnel_start() {
     printf '%s\n' "$local_port"
     printf '%s\n' "$remote_port"
     printf '%s\n' "$control"
+    printf '%s\n' "$bind_address"
   } > "$tmp" || { rm -f "$tmp"; die "cannot write tunnel state"; }
   chmod 600 "$tmp" 2>/dev/null || true
 
   if [ "$compress" -eq 1 ]; then
     ssh -M -S "$control" -f -N -T -C \
       -o ExitOnForwardFailure=yes -o ControlPersist=no \
-      -L "127.0.0.1:${local_port}:127.0.0.1:${remote_port}" "$name" \
+      -L "${bind_address}:${local_port}:127.0.0.1:${remote_port}" "$name" \
       || { rm -f "$tmp" "$control"; die "cannot start tunnel"; }
   else
     ssh -M -S "$control" -f -N -T \
       -o ExitOnForwardFailure=yes -o ControlPersist=no \
-      -L "127.0.0.1:${local_port}:127.0.0.1:${remote_port}" "$name" \
+      -L "${bind_address}:${local_port}:127.0.0.1:${remote_port}" "$name" \
       || { rm -f "$tmp" "$control"; die "cannot start tunnel"; }
   fi
   if ! mv "$tmp" "$state"; then
@@ -680,7 +709,7 @@ cmd_tunnel_start() {
     rm -f "$tmp" "$control"
     die "cannot save tunnel state"
   fi
-  printf "Started tunnel '%s': 127.0.0.1:%s -> 127.0.0.1:%s\n" "$name" "$local_port" "$remote_port"
+  printf "Started tunnel '%s': %s:%s -> 127.0.0.1:%s\n" "$name" "$bind_address" "$local_port" "$remote_port"
 }
 
 cmd_tunnel_list() {
@@ -694,7 +723,7 @@ cmd_tunnel_list() {
       continue
     fi
     if tunnel_is_running "$TUNNEL_NAME" "$TUNNEL_CONTROL"; then
-      printf '%-22s %-23s %-23s %s\n' "$TUNNEL_NAME" "127.0.0.1:$TUNNEL_LOCAL_PORT" \
+      printf '%-22s %-23s %-23s %s\n' "$TUNNEL_NAME" "$TUNNEL_BIND_ADDRESS:$TUNNEL_LOCAL_PORT" \
         "127.0.0.1:$TUNNEL_REMOTE_PORT" running
       count=$((count + 1))
     else
@@ -746,7 +775,7 @@ cmd_tunnel() {
   case "${1:-}" in
     list|ls) [ $# -eq 1 ] || die "usage: macssh tunnel list"; cmd_tunnel_list ;;
     stop|rm|kill) cmd_tunnel_stop "$@" ;;
-    '') die "usage: macssh tunnel [start] <name> <remote-port> [--local LOCAL_PORT]" ;;
+    '') die "usage: macssh tunnel [start] <name> <remote-port> [--local LOCAL_PORT] [--bind ADDRESS]" ;;
     *) cmd_tunnel_start "$@" ;;
   esac
 }

@@ -46,6 +46,7 @@ printf '%s' "$help_output" | grep -Fq 'macssh put' || fail 'help omitted put'
 printf '%s' "$help_output" | grep -Fq 'macssh get' || fail 'help omitted get'
 printf '%s' "$help_output" | grep -Fq -- '--log' || fail 'help omitted --log'
 printf '%s' "$help_output" | grep -Fq 'macssh tunnel' || fail 'help omitted tunnel'
+printf '%s' "$help_output" | grep -Fq -- '--bind ADDRESS' || fail 'help omitted tunnel --bind'
 
 "$project_dir/macssh" add transfer --host example.com --user ubuntu --yes >/dev/null
 
@@ -140,10 +141,20 @@ printf '%s' "$custom_output" | grep -Fq '127.0.0.1:15903 -> 127.0.0.1:5903' || f
 grep -Fq -- '-f -N -T -C' "$SSH_LOG" || fail 'tunnel --compress omitted -C'
 grep -Fq -- '-L 127.0.0.1:15903:127.0.0.1:5903 transfer' "$SSH_LOG" || fail 'tunnel passed the wrong custom mapping'
 
+bind_output=$("$project_dir/macssh" tunnel transfer 5904 --local 15904 --bind 0.0.0.0)
+printf '%s' "$bind_output" | grep -Fq '0.0.0.0:15904 -> 127.0.0.1:5904' || fail 'tunnel omitted bind mapping'
+grep -Fq -- '-L 0.0.0.0:15904:127.0.0.1:5904 transfer' "$SSH_LOG" || fail 'tunnel passed the wrong bind mapping'
+bind_list=$("$project_dir/macssh" tunnel list)
+printf '%s' "$bind_list" | grep -Fq '0.0.0.0:15904' || fail 'tunnel list omitted bind address'
+"$project_dir/macssh" tunnel stop transfer 15904 >/dev/null
+
 if "$project_dir/macssh" tunnel transfer 6000 --local 15903 >/dev/null 2>&1; then fail 'tunnel reused a managed local port'; fi
 if "$project_dir/macssh" tunnel missing-host 5904 >/dev/null 2>&1; then fail 'tunnel accepted an unknown host'; fi
 if "$project_dir/macssh" tunnel transfer 70000 >/dev/null 2>&1; then fail 'tunnel accepted an invalid remote port'; fi
 if "$project_dir/macssh" tunnel transfer 5904 --local 0 >/dev/null 2>&1; then fail 'tunnel accepted an invalid local port'; fi
+if "$project_dir/macssh" tunnel transfer 5904 --bind 999.1.1.1 >/dev/null 2>&1; then fail 'tunnel accepted an invalid bind address'; fi
+if "$project_dir/macssh" tunnel transfer 5904 --bind localhost >/dev/null 2>&1; then fail 'tunnel accepted a non-IPv4 bind address'; fi
+if "$project_dir/macssh" tunnel transfer 5904 --bind 10.0.0.1. >/dev/null 2>&1; then fail 'tunnel accepted a malformed bind address'; fi
 
 stop_output=$("$project_dir/macssh" tunnel kill transfer 15903)
 printf '%s' "$stop_output" | grep -Fq "Stopped tunnel 'transfer'" || fail 'tunnel stop omitted confirmation'

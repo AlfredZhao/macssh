@@ -88,6 +88,12 @@ macssh tunnel prod 5902
 
 # 本机 15902 -> prod 主机的 127.0.0.1:5902
 macssh tunnel prod 5902 --local 15902
+
+# 显式监听所有本机 IPv4 网卡，允许局域网设备通过本机 IP 访问
+macssh tunnel prod 5902 --bind 0.0.0.0
+
+# 只监听指定的局域网网卡地址
+macssh tunnel prod 5902 --local 15902 --bind 192.168.1.10
 ```
 
 隧道连接成功后自动在后台运行，不占用当前终端。需要 SSH 压缩时可以增加 `--compress`。
@@ -100,8 +106,10 @@ macssh tunnel stop prod 15902
 macssh tunnel stop --all
 ```
 
-`port` 是 `tunnel` 的简写，例如 `macssh port prod 5902`。映射只监听本机
-`127.0.0.1`，不会直接暴露到局域网。状态文件保存在
+`port` 是 `tunnel` 的简写，例如 `macssh port prod 5902`。默认只监听本机
+`127.0.0.1`，不会直接暴露到局域网。只有显式指定 `--bind` 才会监听其他
+IPv4 地址；使用 `--bind 0.0.0.0` 会向所有本机 IPv4 网卡开放端口，请同时检查
+macOS 防火墙并确保局域网可信。状态文件保存在
 `~/.ssh/macssh-tunnels/`。`kill` 也可以作为 `stop` 的别名。
 
 ## 6. 上传和下载
@@ -167,7 +175,7 @@ macssh                  选择并连接主机
 macssh add [名称]       添加主机
 macssh list             查看主机
 macssh connect [名称] [--log]  连接主机，可选记录会话日志
-macssh tunnel <名称> <远程端口> [--local 本地端口]  启动后台端口映射
+macssh tunnel <名称> <远程端口> [--local 本地端口] [--bind IPv4地址]  启动后台端口映射
 macssh tunnel list              查看活动端口映射
 macssh tunnel stop <名称> <本地端口>  停止端口映射
 macssh tunnel stop --all        停止全部端口映射
